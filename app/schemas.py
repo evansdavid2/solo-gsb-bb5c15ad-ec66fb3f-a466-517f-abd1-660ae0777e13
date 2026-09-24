@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .grid import parse_rational
+from .grid import parse_nonnegative_rational, parse_rational
 
 
 class EventIn(BaseModel):
@@ -153,3 +153,55 @@ class LoopAlignmentOut(BaseModel):
     voices: dict[str, list[str]]
     expanded_events: int
     segments: list[AlignmentSegmentOut]
+
+
+class QuantizationPreviewIn(BaseModel):
+    """Preview parameters: grid division count and per-point shift bound."""
+
+    divisions: int = Field(ge=1, le=128, examples=[8])
+    max_shift: str = Field(examples=["1/8"])
+
+    @field_validator("max_shift")
+    @classmethod
+    def max_shift_must_be_nonnegative_rational(cls, value: str) -> str:
+        try:
+            parse_nonnegative_rational(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class QuantizedEventOut(BaseModel):
+    """An original event requantized onto the tick grid."""
+
+    id: str
+    kind: Literal["sound", "rest"]
+    start: str
+    end: str
+    duration: str
+
+
+class QuantizedVoiceOut(BaseModel):
+    name: str
+    events: list[QuantizedEventOut]
+
+
+class BoundaryMappingOut(BaseModel):
+    """One shared original event boundary and its mapped grid point."""
+
+    original: str
+    tick: int
+    quantized: str
+    # quantized - original (may be negative).
+    shift: str
+
+
+class QuantizationPreviewOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    divisions: int
+    grid_step: str
+    max_shift: str
+    total_abs_shift: str
+    boundaries: list[BoundaryMappingOut]
+    voices: list[QuantizedVoiceOut]

@@ -155,6 +155,155 @@ def test_unknown_measure_returns_404():
     assert client.get("/measures/999999/grid").status_code == 404
 
 
+# --- POST /measures/{id}/quantization-preview ------------------------------
+
+# Melody edges at 0, 1/2, 3/4, 1 and bass edges at 0, 1/4, 1.
+def test_quantization_preview_maps_boundaries_and_events_without_saving():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 4, "max_shift": "0"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["divisions"] == 4
+    assert body["grid_step"] == "1/4"
+    assert body["max_shift"] == "0"
+    assert body["total_abs_shift"] == "0"
+
+    assert [(b["original"], b["tick"], b["quantized"], b["shift"]) for b in body["boundaries"]] == [
+        ("0", 0, "0", "0"),
+        ("1/4", 1, "1/4", "0"),
+        ("1/2", 2, "1/2", "0"),
+        ("3/4", 3, "3/4", "0"),
+        ("1", 4, "1", "0"),
+    ]
+
+    melody = body["voices"][0]
+    assert melody["name"] == "melody"
+    assert melody["events"] == [
+        {"id": "v1e1", "kind": "sound", "start": "0", "end": "1/2", "duration": "1/2"},
+        {"id": "v1e2", "kind": "rest", "start": "1/2", "end": "3/4", "duration": "1/4"},
+        {"id": "v1e3", "kind": "sound", "start": "3/4", "end": "1", "duration": "1/4"},
+    ]
+    bass = body["voices"][1]
+    assert bass["events"] == [
+        {"id": "v2e1", "kind": "rest", "start": "0", "end": "1/4", "duration": "1/4"},
+        {"id": "v2e2", "kind": "sound", "start": "1/4", "end": "1", "duration": "3/4"},
+    ]
+
+    # The preview is read-only: the stored measure is unchanged.
+    stored = client.get(f"/measures/{measure_id}").json()
+    assert stored["voices"][0]["events"][0]["end"] == "1/2"
+
+
+def test_quantization_preview_shifts_onto_grid_and_minimizes_total_shift():
+    # Thirds-against-halves measure, eighth grid: 1/3 -> tick 3 (3/8),
+    # 1/2 -> tick 4 (1/2); |3/8 - 1/3| = 1/24 total.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "x", "events": [
+                {"kind": "sound", "duration": "1/3"},
+                {"kind": "rest", "duration": "2/3"},
+            ]},
+            {"name": "y", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/2"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 8, "max_shift": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["grid_step"] == "1/8"
+    assert [(b["original"], b["tick"], b["shift"]) for b in body["boundaries"]] == [
+        ("0", 0, "0"),
+        ("1/3", 3, "1/24"),
+        ("1/2", 4, "0"),
+        ("1", 8, "0"),
+    ]
+    assert body["total_abs_shift"] == "1/24"
+    quantized_x = body["voices"][0]["events"]
+    assert quantized_x[0] == {
+        "id": "v1e1", "kind": "sound", "start": "0", "end": "3/8",
+        "duration": "3/8",
+    }
+    assert quantized_x[1]["start"] == "3/8"
+    assert quantized_x[1]["end"] == "1"
+    # Ticks strictly increase.
+    ticks = [b["tick"] for b in body["boundaries"]]
+    assert ticks == sorted(set(ticks))
+
+
+def test_quantization_preview_infeasible_returns_422_and_does_not_save():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # A one-division grid only has ticks 0 and 1 for five distinct edges.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 1, "max_shift": "1"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["divisions"] == 1
+    assert detail["max_shift"] == "1"
+    assert "reason" in detail
+    assert "saved" in detail["message"]
+
+    # A tight max_shift that no tick for 1/4 can satisfy on an eighth
+    # grid? nearest eighth is exactly 2/8 = 1/4, so instead request a
+    # grid whose tick spacing leaves no close tick: d = 3 (step 1/3),
+    # boundary 1/2 sits between ticks 1 (1/3) and 2 (2/3), both 1/6
+    # away; max_shift 1/8 < 1/6.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 3, "max_shift": "1/8"},
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_quantization_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/quantization-preview",
+        json={"divisions": 4, "max_shift": "0"},
+    )
+    assert response.status_code == 404
+
+
+def test_quantization_preview_validates_payload():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # divisions out of the 1..128 range.
+    for divisions in (0, 129, -1):
+        response = client.post(
+            f"/measures/{measure_id}/quantization-preview",
+            json={"divisions": divisions, "max_shift": "0"},
+        )
+        assert response.status_code == 422, divisions
+    # max_shift must be a non-negative rational string.
+    for bad in ("-1/2", "abc", "1.5", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/quantization-preview",
+            json={"divisions": 4, "max_shift": bad},
+        )
+        assert response.status_code == 422, bad
+    # "0" is a valid non-negative max_shift.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 4, "max_shift": "0"},
+    )
+    assert response.status_code == 200, response.text
+    # Missing body / field.
+    assert client.post(
+        f"/measures/{measure_id}/quantization-preview", json={}
+    ).status_code == 422
+
+
 # --- POST /loop-alignments -------------------------------------------------
 
 # Loop B: length 3/2 (target 3/2), "bass" rests all the way through.

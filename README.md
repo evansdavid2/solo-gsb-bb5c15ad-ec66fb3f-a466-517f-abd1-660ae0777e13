@@ -12,7 +12,8 @@
 docker compose up --build
 ```
 
-该命令完成依赖安装、SQLite 数据库初始化（应用启动时自动建表）并启动服务。
+该命令完成依赖安装、SQLite 数据库初始化（应用启动时自动建表）并启动服务，**无需任何
+额外步骤**；服务监听容器内 **8000** 端口，Compose 将宿主机 **8000** 端口映射到它。
 
 - API 地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
@@ -88,6 +89,85 @@ curl -s -X POST http://localhost:8000/measures \
     {"start": "1/2", "end": "3/4", "events": {"melody": null,   "bass": "v2e2"}},
     {"start": "3/4", "end": "1",   "events": {"melody": "v1e3", "bass": "v2e2"}}
   ]
+}
+```
+
+### `POST /measures/{id}/quantization-preview` — 量化到等分刻度（预览，不写库）
+
+把已保存小节**所有声部的不同事件边界**（各事件起止点的并集）统一映射到把目标时长
+等分为 `divisions` 份的刻度网格上（刻度间隔 = 目标时长 / `divisions`）。映射必须：
+
+1. **固定首尾**：边界 `0` 映射到刻度 0，边界 `目标时长` 映射到刻度 `divisions`；
+2. **严格递增**：随边界顺序映射到严格递增的不同刻度（多个边界不能挤到同一刻度）；
+3. **共享边界一致**：多个声部在同一时刻的边界只映射一次，量化后各声部在该点完全对齐；
+4. **逐点限偏**：每个边界的偏移绝对值 `|量化后 − 原边界|` 都不超过 `max_shift`。
+
+在所有可行映射中，使**偏移绝对值总和最小**；总和相同时，取**刻度序列字典序最小**
+（越靠前的边界越优先取更小刻度）。全部运算使用 `fractions.Fraction` 精确完成。
+
+- 请求体：`divisions` 为 **1～128** 的整数；`max_shift` 为**非负有理数字符串**
+  （允许 `"0"`，其余规则同时长格式）。越界或格式错误返回 **422**（请求校验错误）。
+- 小节 ID 不存在返回 **404**。
+- 不存在满足上述条件的映射时返回 **422**，detail 给出 `reason` / `divisions` /
+  `max_shift`；该接口为**只读预览，不写入数据库**，已保存小节保持不变。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/quantization-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"divisions": 8, "max_shift": "1/8"}'
+```
+
+例：小节时长 `1`，声部边界在 `1/3`、`1/2` 等处；8 等分刻度间隔 `1/8`，`1/3` 就近
+映射到刻度 3（`3/8`，偏移 `+1/24`），`1/2` 恰在刻度 4，偏移总和 `1/24`：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "divisions": 8,
+  "grid_step": "1/8",
+  "max_shift": "1/8",
+  "total_abs_shift": "1/24",
+  "boundaries": [
+    {"original": "0",    "tick": 0, "quantized": "0",   "shift": "0"},
+    {"original": "1/3",  "tick": 3, "quantized": "3/8", "shift": "1/24"},
+    {"original": "1/2",  "tick": 4, "quantized": "1/2", "shift": "0"},
+    {"original": "1",    "tick": 8, "quantized": "1",   "shift": "0"}
+  ],
+  "voices": [
+    {"name": "x", "events": [
+      {"id": "v1e1", "kind": "sound", "start": "0",   "end": "3/8", "duration": "3/8"},
+      {"id": "v1e2", "kind": "rest",  "start": "3/8", "end": "1",   "duration": "5/8"}
+    ]},
+    {"name": "y", "events": [
+      {"id": "v2e1", "kind": "rest",  "start": "0",   "end": "1/2", "duration": "1/2"},
+      {"id": "v2e2", "kind": "sound", "start": "1/2", "end": "1",   "duration": "1/2"}
+    ]}
+  ]
+}
+```
+
+各字段含义：
+
+| 字段               | 说明                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| `grid_step`        | 等分刻度间隔（= `target_duration / divisions`，精确分数）            |
+| `total_abs_shift`  | 全部不同边界偏移绝对值之和（最小化目标，精确分数）                   |
+| `boundaries`       | 原边界 → 新边界对应关系：`original` / `tick`（刻度序号，0 起）/ `quantized` / `shift`（= quantized − original，可为负） |
+| `voices[].events`  | 各声部**原事件 ID** 与种类，以及量化后的 `start` / `end` / `duration`；时长严格为正且逐声部首尾拼成目标时长 |
+
+`max_shift` 过紧、或刻度数不足以容纳所有边界（内部不同边界数超过 `divisions - 1`）时
+不可行，例如 3 等分网格（刻度在 `1/3`、`2/3`）下边界 `1/2` 距两个相邻刻度都是 `1/6`，
+`max_shift = "1/8"` 时返回 **422**：
+
+```json
+{
+  "detail": {
+    "message": "no quantization of the measure's event boundaries onto the requested grid stays within max_shift; nothing was saved",
+    "reason": "boundary 1/2 has no grid tick within max_shift 1/8",
+    "divisions": 3,
+    "max_shift": "1/8"
+  }
 }
 ```
 
@@ -205,7 +285,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

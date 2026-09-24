@@ -12,7 +12,14 @@ the service computes the first instant both loops restart together and
 returns the repeated timeline cut at every event boundary, tagged with
 each sounding event's original id and its 1-based loop number.
 
-A saved voice can finally be used as a rhythm query
+A saved measure's event boundaries can finally be quantized onto an
+even tick grid (POST /measures/{id}/quantization-preview): all distinct
+boundaries across voices are mapped to ticks of a target-division grid,
+endpoints fixed, staying strictly increasing within a per-point shift
+bound, minimizing total absolute shift. The result is a preview only;
+nothing is written back to SQLite.
+
+A saved voice can also be used as a rhythm query
 (GET /measures/{id}/rhythm-matches): other saved voices whose
 sound/rest pattern is the same sequence up to a cyclic shift and a
 single uniform tempo ratio are returned with that ratio and the
@@ -30,12 +37,15 @@ from . import db
 from .grid import (
     MAX_EXPANDED_EVENTS,
     LoopAlignmentTooLarge,
+    QuantizationInfeasible,
     align_loops,
     build_voice_events,
     compute_grid,
     find_rhythm_match,
     format_rational,
+    parse_nonnegative_rational,
     parse_rational,
+    quantize_measure,
     voice_total,
 )
 from .schemas import (
@@ -45,6 +55,8 @@ from .schemas import (
     MeasureIn,
     MeasureOut,
     Mismatch,
+    QuantizationPreviewIn,
+    QuantizationPreviewOut,
     RhythmMatchesOut,
 )
 
@@ -73,6 +85,7 @@ def root() -> dict:
             "create_measure": "POST /measures",
             "get_measure": "GET /measures/{id}",
             "get_grid": "GET /measures/{id}/grid",
+            "quantization_preview": "POST /measures/{id}/quantization-preview",
             "rhythm_matches": "GET /measures/{id}/rhythm-matches?voice={name}",
             "loop_alignments": "POST /loop-alignments",
         },
@@ -167,6 +180,70 @@ def get_grid(measure_id: int) -> dict:
                 "events": segment["events"],
             }
             for segment in segments
+        ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/quantization-preview",
+    response_model=QuantizationPreviewOut,
+)
+def quantization_preview(measure_id: int, payload: QuantizationPreviewIn) -> dict:
+    # Read-only: the measure is loaded from SQLite and the quantized
+    # result is computed in exact fractions, but never written back.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    length, voices = _fraction_voices(measure)
+    max_shift = parse_nonnegative_rational(payload.max_shift)
+    try:
+        result = quantize_measure(
+            length, voices, payload.divisions, max_shift
+        )
+    except QuantizationInfeasible as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "no quantization of the measure's event boundaries "
+                "onto the requested grid stays within max_shift; nothing was saved",
+                "reason": exc.reason,
+                "divisions": payload.divisions,
+                "max_shift": format_rational(max_shift),
+            },
+        ) from exc
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "divisions": result["divisions"],
+        "grid_step": format_rational(result["grid_step"]),
+        "max_shift": format_rational(result["max_shift"]),
+        "total_abs_shift": format_rational(result["total_abs_shift"]),
+        "boundaries": [
+            {
+                "original": format_rational(boundary["original"]),
+                "tick": boundary["tick"],
+                "quantized": format_rational(boundary["quantized"]),
+                "shift": format_rational(boundary["shift"]),
+            }
+            for boundary in result["boundaries"]
+        ],
+        "voices": [
+            {
+                "name": voice["name"],
+                "events": [
+                    {
+                        "id": event["id"],
+                        "kind": event["kind"],
+                        "start": format_rational(event["start"]),
+                        "end": format_rational(event["end"]),
+                        "duration": format_rational(event["duration"]),
+                    }
+                    for event in voice["events"]
+                ],
+            }
+            for voice in result["voices"]
         ],
     }
 

@@ -24,12 +24,8 @@ KINDS = (KIND_SOUND, KIND_REST)
 MAX_EXPANDED_EVENTS = 2000
 
 
-def parse_rational(text: str) -> Fraction:
-    """Parse a positive rational string ("2", "3/4") into a Fraction.
-
-    Raises ValueError on malformed input, zero denominators, or
-    non-positive values.
-    """
+def _parse_unsigned_rational(text: str) -> Fraction:
+    """Shared parser for non-negative fraction strings (no sign)."""
     if not isinstance(text, str):
         raise ValueError(f"rational must be a string, got {type(text).__name__}")
     match = _RATIONAL_RE.match(text.strip())
@@ -39,10 +35,27 @@ def parse_rational(text: str) -> Fraction:
     denominator = int(match.group(2)) if match.group(2) else 1
     if denominator == 0:
         raise ValueError(f"denominator must not be zero: {text!r}")
-    value = Fraction(numerator, denominator)
+    return Fraction(numerator, denominator)
+
+
+def parse_rational(text: str) -> Fraction:
+    """Parse a positive rational string ("2", "3/4") into a Fraction.
+
+    Raises ValueError on malformed input, zero denominators, or
+    non-positive values.
+    """
+    value = _parse_unsigned_rational(text)
     if value <= 0:
         raise ValueError(f"duration must be positive, got {text!r}")
     return value
+
+
+def parse_nonnegative_rational(text: str) -> Fraction:
+    """Parse a non-negative rational string ("0", "2", "3/4") into a Fraction.
+
+    Raises ValueError on malformed input or zero denominators.
+    """
+    return _parse_unsigned_rational(text)
 
 
 def format_rational(value: Fraction) -> str:
@@ -309,4 +322,215 @@ def align_loops(
         "repetitions": {"a": reps_a, "b": reps_b},
         "expanded_events": expanded,
         "segments": segments,
+    }
+
+
+class QuantizationInfeasible(Exception):
+    """No strictly increasing tick mapping keeps every shift within bound."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"quantization infeasible: {reason}")
+        self.reason = reason
+
+
+def _floor_fraction(value: Fraction) -> int:
+    """Floor of a Fraction: numerator // denominator (exact, any sign)."""
+    return value.numerator // value.denominator
+
+
+def _ceil_fraction(value: Fraction) -> int:
+    """Ceiling of a Fraction: -floor(-value)."""
+    return -((-value.numerator) // value.denominator)
+
+
+def quantize_measure(
+    length: Fraction,
+    voices: list[dict],
+    divisions: int,
+    max_shift: Fraction,
+) -> dict:
+    """Quantize a saved measure's shared boundaries onto an even tick grid.
+
+    The target grid divides ``length`` into ``divisions`` equal steps;
+    every distinct event boundary of every voice is mapped to one grid
+    tick. A feasible mapping must:
+
+    * fix the first boundary (0) to tick 0 and the last boundary
+      (``length``) to tick ``divisions``;
+    * map shared boundaries (the same instant in several voices) to one
+      tick, so the mapping stays consistent across voices;
+    * stay strictly increasing with the boundary order;
+    * move each boundary by at most ``max_shift`` in absolute value.
+
+    Among all feasible mappings it minimizes the sum of absolute shifts;
+    ties are broken by the lexicographically smallest tick sequence.
+    Raises QuantizationInfeasible when no feasible mapping exists.
+
+    ``voices`` items are {"name": str, "events": [built events]}. Returns
+    the shared boundary mapping plus, per voice, every original event
+    with its quantized start/end/duration.
+
+    Optimization: let boundary p_i map to tick k_i. The cost is
+    sum |k_i * length/divisions - p_i|, a sum of terms depending on one
+    variable each, plus the strict-increase constraint k_{i-1} < k_i.
+    A dynamic program over (boundary, tick) gives the minimum remaining
+    cost suf[i][k]; ties are then resolved greedily by always choosing
+    the smallest feasible tick, which yields the lexicographically
+    smallest optimal tick sequence.
+    """
+    points: set[Fraction] = set()
+    for voice in voices:
+        for event in voice["events"]:
+            points.add(event["start"])
+            points.add(event["end"])
+    boundaries = sorted(points)
+    count = len(boundaries)
+
+    assert boundaries[0] == Fraction(0)
+    assert boundaries[-1] == length
+
+    # Ticks are 0..divisions and mapped ticks must be strictly increasing,
+    # so more distinct boundaries than ticks can never fit.
+    if count > divisions + 1:
+        raise QuantizationInfeasible("more distinct boundaries than grid ticks")
+
+    step = length / divisions
+
+    # Per-boundary tick windows [lower_i, upper_i] imposed by max_shift:
+    # ticks k satisfying |k*step - point| <= max_shift, i.e.
+    # (point - max_shift)/step <= k <= (point + max_shift)/step.
+    windows: list[tuple[int, int]] = []
+    for point in boundaries:
+        lower = max(0, _ceil_fraction((point - max_shift) / step))
+        upper = min(divisions, _floor_fraction((point + max_shift) / step))
+        windows.append((lower, upper))
+        if lower > upper:
+            raise QuantizationInfeasible(
+                f"boundary {format_rational(point)} has no grid tick "
+                f"within max_shift {format_rational(max_shift)}"
+            )
+
+    # Greedy monotonic precheck: assign each boundary the smallest tick
+    # above its predecessor inside its window. Failure certifies that no
+    # strictly increasing mapping exists at all.
+    previous = -1
+    for index, (point, (lower, upper)) in enumerate(
+        zip(boundaries, windows)
+    ):
+        tick = max(lower, previous + 1)
+        if tick > upper:
+            if index == count - 1:
+                raise QuantizationInfeasible(
+                    "not enough grid ticks to keep boundaries strictly increasing"
+                )
+            raise QuantizationInfeasible(
+                f"boundary {format_rational(point)} cannot follow the "
+                "preceding boundaries within max_shift"
+            )
+        previous = tick
+
+    def shift_cost(index: int, tick: int) -> Fraction:
+        return abs(tick * step - boundaries[index])
+
+    # DP over boundaries from the end. rows[i][k] = minimum total shift
+    # of boundaries i..n-1 given boundary i maps to tick k (with the
+    # chain staying strictly increasing inside each window); None when
+    # no completion exists. Rows have length divisions + 1.
+    rows: list[list[Fraction | None]] = [
+        [None] * (divisions + 1) for _ in range(count)
+    ]
+
+    last = count - 1
+    # The final boundary is fixed to the last tick (precheck above has
+    # certified that tick lies in its window).
+    rows[last][divisions] = shift_cost(last, divisions)
+
+    for index in range(last - 1, -1, -1):
+        lower, upper = windows[index]
+        row = rows[index]
+        next_row = rows[index + 1]
+        # suffix_min[k] = min(next_row[k..divisions]): the cheapest
+        # strictly greater tick reachable from the tick chosen here.
+        suffix_min: list[Fraction | None] = [None] * (divisions + 2)
+        running: Fraction | None = None
+        for tick in range(divisions, -1, -1):
+            value = next_row[tick]
+            if value is not None and (running is None or value < running):
+                running = value
+            suffix_min[tick] = running
+        for tick in range(lower, upper + 1):
+            candidate = suffix_min[tick + 1]
+            if candidate is not None:
+                row[tick] = shift_cost(index, tick) + candidate
+
+    # The first boundary is fixed to tick 0 (it always lies in window 0;
+    # None means the fixed endpoints leave no feasible middle chain).
+    optimal_cost = rows[0][0]
+    if optimal_cost is None:
+        raise QuantizationInfeasible(
+            "no strictly increasing tick mapping stays within max_shift"
+        )
+
+    # Greedy reconstruction: at each boundary pick the smallest tick that
+    # can still complete an optimum. With earlier costs already fixed,
+    # suffix equality is exactly the membership test for an optimal
+    # completion, so the smallest such tick gives the lexicographically
+    # smallest tick sequence.
+    ticks = [0]
+    spent = shift_cost(0, 0)
+    for index in range(1, count):
+        lower, upper = windows[index]
+        chosen: int | None = None
+        for tick in range(max(lower, ticks[-1] + 1), upper + 1):
+            remaining = rows[index][tick]
+            if remaining is not None and spent + remaining == optimal_cost:
+                chosen = tick
+                break
+        if chosen is None:  # pragma: no cover - DP guarantees an optimum
+            raise QuantizationInfeasible(
+                "no strictly increasing tick mapping stays within max_shift"
+            )
+        ticks.append(chosen)
+        spent += shift_cost(index, chosen)
+
+    mapped = [tick * step for tick in ticks]
+
+    quantized_voices = []
+    index_of_point = {point: index for index, point in enumerate(boundaries)}
+    for voice in voices:
+        events_out = []
+        for event in voice["events"]:
+            # Shared boundaries share a mapped point by construction, so
+            # coincident edges across voices never disagree.
+            start = mapped[index_of_point[event["start"]]]
+            end = mapped[index_of_point[event["end"]]]
+            events_out.append(
+                {
+                    "id": event["id"],
+                    "kind": event["kind"],
+                    "start": start,
+                    "end": end,
+                    "duration": end - start,
+                }
+            )
+        quantized_voices.append({"name": voice["name"], "events": events_out})
+
+    return {
+        "divisions": divisions,
+        "grid_step": step,
+        "max_shift": max_shift,
+        "total_abs_shift": sum(
+            abs(mapped_point - point)
+            for point, mapped_point in zip(boundaries, mapped)
+        ),
+        "boundaries": [
+            {
+                "original": point,
+                "tick": tick,
+                "quantized": tick * step,
+                "shift": tick * step - point,
+            }
+            for point, tick in zip(boundaries, ticks)
+        ],
+        "voices": quantized_voices,
     }
