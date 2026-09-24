@@ -2,7 +2,8 @@
 
 Pure standard-library module: durations are exact ``fractions.Fraction``
 values parsed from positive rational strings, and the grid is built from
-the union of every voice's event boundaries.
+the union of every voice's event boundaries. The same boundary union can
+also be snapped onto an equal-division grid (quantization preview).
 """
 
 from __future__ import annotations
@@ -50,6 +51,24 @@ def format_rational(value: Fraction) -> str:
     if value.denominator == 1:
         return str(value.numerator)
     return f"{value.numerator}/{value.denominator}"
+
+
+def parse_nonnegative_rational(text: str) -> Fraction:
+    """Parse a non-negative rational string ("0", "2", "3/4").
+
+    Same accepted syntax as parse_rational, but zero is allowed (used
+    for shift budgets, where 0 means "must already lie on the grid").
+    """
+    if not isinstance(text, str):
+        raise ValueError(f"rational must be a string, got {type(text).__name__}")
+    match = _RATIONAL_RE.match(text.strip())
+    if not match:
+        raise ValueError(f"invalid rational number: {text!r}")
+    numerator = int(match.group(1))
+    denominator = int(match.group(2)) if match.group(2) else 1
+    if denominator == 0:
+        raise ValueError(f"denominator must not be zero: {text!r}")
+    return Fraction(numerator, denominator)
 
 
 def event_id(voice_index: int, event_index: int) -> str:
@@ -128,6 +147,95 @@ def compute_grid(voices: list[dict]) -> list[dict]:
             )
         segments.append({"start": start, "end": end, "events": active})
     return segments
+
+
+def quantize_boundaries(
+    boundaries: list[Fraction],
+    total: Fraction,
+    divisions: int,
+    max_shift: Fraction,
+) -> list[Fraction] | None:
+    """Snap sorted distinct boundaries onto the equal-division grid.
+
+    The grid is the ticks ``k * total / divisions`` for k in
+    0..divisions. The first boundary (0) and the last one (``total``)
+    are pinned to ticks 0 and ``divisions``; every boundary keeps a
+    strictly increasing tick index (so shared boundaries stay together
+    and every event keeps a positive quantized duration) and may move
+    by at most ``max_shift``.
+
+    Among all feasible mappings the one minimizing the sum of absolute
+    shifts is returned; ties are broken by the lexicographically
+    smallest tick-index sequence (equivalently: boundaries are placed
+    on the earliest ticks that still allow an optimal completion).
+
+    ``boundaries`` must be sorted, duplicate-free, and span exactly
+    [0, total]. Returns the quantized offsets (parallel to
+    ``boundaries``), or None when no feasible mapping exists.
+    """
+    count = len(boundaries)
+    if count < 2 or boundaries[0] != 0 or boundaries[-1] != total:
+        raise ValueError("boundaries must span exactly [0, total]")
+    if divisions < 1:
+        raise ValueError("divisions must be a positive integer")
+    if count - 1 > divisions:
+        # Strictly increasing ticks for `count` boundaries need at
+        # least `count` distinct grid points.
+        return None
+    ticks = [Fraction(k) * total / divisions for k in range(divisions + 1)]
+
+    # Ticks each boundary may take; the endpoints are pinned.
+    allowed: list[list[int]] = []
+    for index, boundary in enumerate(boundaries):
+        if index == 0:
+            allowed.append([0])
+        elif index == count - 1:
+            allowed.append([divisions])
+        else:
+            allowed.append(
+                [
+                    tick
+                    for tick in range(divisions + 1)
+                    if abs(ticks[tick] - boundary) <= max_shift
+                ]
+            )
+
+    # suffix[i][tick]: minimal total shift of boundaries i..count-1
+    # with boundary i placed on `tick` (absent key = infeasible).
+    suffix: list[dict[int, Fraction]] = [dict() for _ in range(count)]
+    for tick in allowed[count - 1]:
+        suffix[count - 1][tick] = abs(ticks[tick] - boundaries[count - 1])
+    for index in range(count - 2, -1, -1):
+        following = suffix[index + 1]
+        best: Fraction | None = None
+        for tick in range(divisions, -1, -1):
+            # best = min cost of any feasible continuation on a tick
+            # strictly greater than `tick`.
+            if tick < divisions:
+                later = following.get(tick + 1)
+                if later is not None and (best is None or later < best):
+                    best = later
+            if tick in allowed[index] and best is not None:
+                suffix[index][tick] = abs(ticks[tick] - boundaries[index]) + best
+
+    if 0 not in suffix[0]:
+        return None
+
+    # Greedy forward pass: at each boundary take the smallest tick that
+    # still admits an optimal completion -> lexicographically smallest
+    # optimal tick sequence.
+    remaining = suffix[0][0]
+    chosen = [0]
+    for index in range(1, count):
+        for tick in range(chosen[-1] + 1, divisions + 1):
+            cost = suffix[index].get(tick)
+            if cost is not None and cost == remaining:
+                chosen.append(tick)
+                remaining -= abs(ticks[tick] - boundaries[index])
+                break
+        else:  # pragma: no cover - the DP tables guarantee a continuation
+            raise AssertionError("no optimal continuation found")
+    return [ticks[tick] for tick in chosen]
 
 
 def find_rhythm_match(

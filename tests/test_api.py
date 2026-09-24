@@ -432,3 +432,189 @@ def test_rhythm_matches_404_for_missing_measure_or_voice():
 def test_rhythm_matches_requires_voice_query_parameter():
     source_id = client.post("/measures", json=RHYTHM_SOURCE_PAYLOAD).json()["id"]
     assert client.get(f"/measures/{source_id}/rhythm-matches").status_code == 422
+
+
+# --- POST /measures/{id}/quantization-preview -------------------------------
+
+# Boundaries: 0, 1/3 (lead), 1/2 (bass), 1.
+QUANTIZE_PAYLOAD = {
+    "target_duration": "1",
+    "voices": [
+        {
+            "name": "lead",
+            "events": [
+                {"kind": "sound", "duration": "1/3"},
+                {"kind": "rest", "duration": "2/3"},
+            ],
+        },
+        {
+            "name": "bass",
+            "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/2"},
+            ],
+        },
+    ],
+}
+
+
+def test_quantization_preview_snaps_shared_boundaries_to_grid():
+    measure_id = client.post("/measures", json=QUANTIZE_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 4, "max_shift": "1/6"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["divisions"] == 4
+    assert body["max_shift"] == "1/6"
+    assert body["tick"] == "1/4"
+
+    # Union of all voices' boundaries: 0, 1/3, 1/2, 1. 1/3 is 1/12 from
+    # tick 1/4 and 1/6 from tick 1/2: the smaller total shift wins.
+    assert body["boundaries"] == [
+        {"original": "0", "quantized": "0"},
+        {"original": "1/3", "quantized": "1/4"},
+        {"original": "1/2", "quantized": "1/2"},
+        {"original": "1", "quantized": "1"},
+    ]
+
+    lead, bass = body["voices"]
+    assert lead["name"] == "lead"
+    assert lead["events"] == [
+        {
+            "id": "v1e1",
+            "kind": "sound",
+            "start": "0",
+            "end": "1/4",
+            "duration": "1/4",
+        },
+        {"id": "v1e2", "kind": "rest", "start": "1/4", "end": "1", "duration": "3/4"},
+    ]
+    assert bass["events"] == [
+        {
+            "id": "v2e1",
+            "kind": "sound",
+            "start": "0",
+            "end": "1/2",
+            "duration": "1/2",
+        },
+        {
+            "id": "v2e2",
+            "kind": "sound",
+            "start": "1/2",
+            "end": "1",
+            "duration": "1/2",
+        },
+    ]
+
+
+def test_quantization_preview_zero_max_shift_requires_exact_grid():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # VALID_PAYLOAD's boundaries are exactly the quarter grid.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 4, "max_shift": "0"},
+    )
+    assert response.status_code == 200, response.text
+    boundaries = response.json()["boundaries"]
+    assert [b["original"] for b in boundaries] == ["0", "1/4", "1/2", "3/4", "1"]
+    assert [b["quantized"] for b in boundaries] == ["0", "1/4", "1/2", "3/4", "1"]
+
+    # The same measure has no exact 3-division grid mapping.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 3, "max_shift": "0"},
+    )
+    assert response.status_code == 422
+
+
+def test_quantization_preview_infeasible_returns_422_and_saves_nothing():
+    measure_id = client.post("/measures", json=QUANTIZE_PAYLOAD).json()["id"]
+    # 1/3 needs a shift of 1/6 to reach a 2-division tick; 1/8 is too
+    # small, so no feasible mapping exists.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 2, "max_shift": "1/8"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["divisions"] == 2
+    assert detail["max_shift"] == "1/8"
+    assert detail["boundary_count"] == 4
+    assert detail["unreachable_boundaries"] == ["1/3"]
+
+    # The failed preview wrote nothing: the next valid measure takes the
+    # very next id.
+    followup = client.post("/measures", json=VALID_PAYLOAD)
+    assert followup.status_code == 201
+    assert followup.json()["id"] == measure_id + 1
+
+
+def test_quantization_preview_too_many_boundaries_is_422():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # 5 distinct boundaries cannot map strictly increasingly onto a
+    # 3-division grid (4 ticks), however large the shift budget.
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 3, "max_shift": "10"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["unreachable_boundaries"] == []
+
+
+def test_quantization_preview_tie_breaks_to_earliest_ticks():
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {
+                "name": "a",
+                "events": [
+                    {"kind": "sound", "duration": "3/8"},
+                    {"kind": "rest", "duration": "5/8"},
+                ],
+            },
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/quantization-preview",
+        json={"divisions": 4, "max_shift": "1/8"},
+    )
+    assert response.status_code == 200, response.text
+    # 3/8 is equally far from ticks 1/4 and 1/2: the earlier tick wins.
+    assert response.json()["boundaries"] == [
+        {"original": "0", "quantized": "0"},
+        {"original": "3/8", "quantized": "1/4"},
+        {"original": "1", "quantized": "1"},
+    ]
+
+
+def test_quantization_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/quantization-preview",
+        json={"divisions": 4, "max_shift": "1/8"},
+    )
+    assert response.status_code == 404
+
+
+def test_quantization_preview_validation():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    for bad in [
+        {"divisions": 0, "max_shift": "1/8"},  # below 1
+        {"divisions": 129, "max_shift": "1/8"},  # above 128
+        {"divisions": "four", "max_shift": "1/8"},  # not an int
+        {"divisions": 4, "max_shift": "-1/8"},  # negative
+        {"divisions": 4, "max_shift": "1.5"},  # decimal
+        {"divisions": 4, "max_shift": "abc"},  # malformed
+        {"divisions": 4, "max_shift": "1/0"},  # zero denominator
+        {"divisions": 4},  # missing max_shift
+        {"max_shift": "1/8"},  # missing divisions
+    ]:
+        response = client.post(
+            f"/measures/{measure_id}/quantization-preview", json=bad
+        )
+        assert response.status_code == 422, bad

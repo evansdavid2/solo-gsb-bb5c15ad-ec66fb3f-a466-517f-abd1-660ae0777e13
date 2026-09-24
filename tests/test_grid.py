@@ -12,7 +12,9 @@ from app.grid import (
     compute_grid,
     find_rhythm_match,
     format_rational,
+    parse_nonnegative_rational,
     parse_rational,
+    quantize_boundaries,
     rational_lcm,
     voice_total,
 )
@@ -45,6 +47,19 @@ class ParseRationalTest(unittest.TestCase):
         self.assertEqual(format_rational(Fraction(3, 4)), "3/4")
         self.assertEqual(format_rational(Fraction(2, 1)), "2")
         self.assertEqual(format_rational(Fraction(0, 1)), "0")
+
+
+class ParseNonnegativeRationalTest(unittest.TestCase):
+    def test_accepts_zero_and_positive(self):
+        self.assertEqual(parse_nonnegative_rational("0"), Fraction(0))
+        self.assertEqual(parse_nonnegative_rational("0/4"), Fraction(0))
+        self.assertEqual(parse_nonnegative_rational("3/4"), Fraction(3, 4))
+        self.assertEqual(parse_nonnegative_rational("2"), Fraction(2))
+
+    def test_rejects_bad_input(self):
+        for bad in ["", "abc", "1/0", "-1/2", "1.5", "1/2/3"]:
+            with self.assertRaises(ValueError, msg=bad):
+                parse_nonnegative_rational(bad)
 
 
 class AccumulationTest(unittest.TestCase):
@@ -232,6 +247,136 @@ class AlignLoopsTest(unittest.TestCase):
         self.assertEqual((error.repetitions_a, error.repetitions_b), (5, 3))
         self.assertEqual(error.expanded_events, 8)
         self.assertEqual(error.max_events, 7)
+
+
+class QuantizeBoundariesTest(unittest.TestCase):
+    def test_boundaries_already_on_grid_stay_put_with_zero_shift(self):
+        boundaries = [
+            Fraction(0),
+            Fraction(1, 4),
+            Fraction(1, 2),
+            Fraction(3, 4),
+            Fraction(1),
+        ]
+        result = quantize_boundaries(boundaries, Fraction(1), 4, Fraction(0))
+        self.assertEqual(result, boundaries)
+
+    def test_snaps_to_nearest_tick_within_max_shift(self):
+        # 1/3 is exactly 1/6 away from tick 1/2 of a 2-division grid.
+        result = quantize_boundaries(
+            [Fraction(0), Fraction(1, 3), Fraction(1)],
+            Fraction(1),
+            2,
+            Fraction(1, 6),
+        )
+        self.assertEqual(result, [Fraction(0), Fraction(1, 2), Fraction(1)])
+
+    def test_infeasible_when_required_shift_exceeds_max(self):
+        # 1/3 needs a shift of 1/6 to reach tick 1/2; 1/7 is not enough.
+        self.assertIsNone(
+            quantize_boundaries(
+                [Fraction(0), Fraction(1, 3), Fraction(1)],
+                Fraction(1),
+                2,
+                Fraction(1, 7),
+            )
+        )
+
+    def test_infeasible_when_more_boundaries_than_grid_points(self):
+        boundaries = [
+            Fraction(0),
+            Fraction(1, 4),
+            Fraction(1, 2),
+            Fraction(3, 4),
+            Fraction(1),
+        ]
+        # 5 strictly increasing boundaries cannot fit on 4 ticks.
+        self.assertIsNone(quantize_boundaries(boundaries, Fraction(1), 3, Fraction(1)))
+
+    def test_strictly_increasing_forces_non_nearest_tick(self):
+        # 7/16 is nearest to tick 1/3 (5/48 away), but 1/4 already
+        # occupies that tick, so 7/16 moves on to tick 2/3 (11/48).
+        result = quantize_boundaries(
+            [Fraction(0), Fraction(1, 4), Fraction(7, 16), Fraction(1)],
+            Fraction(1),
+            3,
+            Fraction(1, 4),
+        )
+        self.assertEqual(
+            result, [Fraction(0), Fraction(1, 3), Fraction(2, 3), Fraction(1)]
+        )
+
+    def test_infeasible_when_boundaries_cannot_stay_ordered(self):
+        # Within 1/8 both 1/4 and 7/16 can only reach tick 1/3, and two
+        # boundaries may not share a tick.
+        self.assertIsNone(
+            quantize_boundaries(
+                [Fraction(0), Fraction(1, 4), Fraction(7, 16), Fraction(1)],
+                Fraction(1),
+                3,
+                Fraction(1, 8),
+            )
+        )
+
+    def test_tie_broken_by_lexicographically_smallest_tick_sequence(self):
+        # 3/8 sits exactly between ticks 1/4 and 1/2: equal total shift
+        # either way, the earlier tick wins.
+        result = quantize_boundaries(
+            [Fraction(0), Fraction(3, 8), Fraction(1)],
+            Fraction(1),
+            4,
+            Fraction(1, 8),
+        )
+        self.assertEqual(result, [Fraction(0), Fraction(1, 4), Fraction(1)])
+
+    def test_tie_break_compares_whole_sequence_not_single_points(self):
+        # 2/5 alone is nearest to tick 1/2, but (1/4, 1/2) and (1/2, 3/4)
+        # tie on total shift 1/4; the lexicographically smaller sequence
+        # (0, 1, 2, 4) wins.
+        result = quantize_boundaries(
+            [Fraction(0), Fraction(2, 5), Fraction(3, 5), Fraction(1)],
+            Fraction(1),
+            4,
+            Fraction(1, 4),
+        )
+        self.assertEqual(
+            result, [Fraction(0), Fraction(1, 4), Fraction(1, 2), Fraction(1)]
+        )
+
+    def test_endpoints_are_pinned_to_grid_ends(self):
+        # With a huge budget the interior boundary still cannot pull the
+        # endpoints off 0 and total.
+        result = quantize_boundaries(
+            [Fraction(0), Fraction(1, 10), Fraction(1)],
+            Fraction(1),
+            4,
+            Fraction(10),
+        )
+        self.assertEqual(result[0], Fraction(0))
+        self.assertEqual(result[-1], Fraction(1))
+        # 1/10's nearest tick is 0 (shift 1/10) but strict increase
+        # forces it to tick 1 (shift 3/20).
+        self.assertEqual(result, [Fraction(0), Fraction(1, 4), Fraction(1)])
+
+    def test_non_unit_total_duration(self):
+        # Grid of a 3/2-long measure in 3 divisions: ticks 0, 1/2, 1, 3/2.
+        result = quantize_boundaries(
+            [Fraction(0), Fraction(2, 5), Fraction(1), Fraction(3, 2)],
+            Fraction(3, 2),
+            3,
+            Fraction(1, 10),
+        )
+        self.assertEqual(
+            result, [Fraction(0), Fraction(1, 2), Fraction(1), Fraction(3, 2)]
+        )
+
+    def test_rejects_malformed_boundaries(self):
+        with self.assertRaises(ValueError):
+            quantize_boundaries([Fraction(0)], Fraction(1), 4, Fraction(0))
+        with self.assertRaises(ValueError):
+            quantize_boundaries(
+                [Fraction(0), Fraction(1)], Fraction(1), 0, Fraction(0)
+            )
 
 
 class FindRhythmMatchTest(unittest.TestCase):

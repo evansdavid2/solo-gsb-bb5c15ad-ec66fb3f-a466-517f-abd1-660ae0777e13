@@ -17,6 +17,15 @@ A saved voice can finally be used as a rhythm query
 sound/rest pattern is the same sequence up to a cyclic shift and a
 single uniform tempo ratio are returned with that ratio and the
 smallest matching shift, all compared in exact fractions.
+
+A saved measure can also be quantized as a preview
+(POST /measures/{id}/quantization-preview): the distinct event
+boundaries of all voices are snapped onto an equal-division grid of
+the target duration — endpoints pinned, strictly increasing, shared
+boundaries mapped consistently — minimizing the total absolute shift
+within a per-point max_shift budget (ties broken by the
+lexicographically smallest tick sequence). The preview never writes
+to the database.
 """
 
 from __future__ import annotations
@@ -35,7 +44,9 @@ from .grid import (
     compute_grid,
     find_rhythm_match,
     format_rational,
+    parse_nonnegative_rational,
     parse_rational,
+    quantize_boundaries,
     voice_total,
 )
 from .schemas import (
@@ -45,6 +56,8 @@ from .schemas import (
     MeasureIn,
     MeasureOut,
     Mismatch,
+    QuantizationPreviewIn,
+    QuantizationPreviewOut,
     RhythmMatchesOut,
 )
 
@@ -75,6 +88,7 @@ def root() -> dict:
             "get_grid": "GET /measures/{id}/grid",
             "rhythm_matches": "GET /measures/{id}/rhythm-matches?voice={name}",
             "loop_alignments": "POST /loop-alignments",
+            "quantization_preview": "POST /measures/{id}/quantization-preview",
         },
     }
 
@@ -167,6 +181,87 @@ def get_grid(measure_id: int) -> dict:
                 "events": segment["events"],
             }
             for segment in segments
+        ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/quantization-preview",
+    response_model=QuantizationPreviewOut,
+)
+def quantization_preview(measure_id: int, payload: QuantizationPreviewIn) -> dict:
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    total, voices = _fraction_voices(measure)
+    max_shift = parse_nonnegative_rational(payload.max_shift)
+
+    # Distinct event boundaries across all voices (0 and total always
+    # included); shared boundaries map to one shared tick by mapping
+    # boundary *values* rather than per-voice occurrences.
+    boundary_set = {Fraction(0), total}
+    for voice in voices:
+        for event in voice["events"]:
+            boundary_set.add(event["start"])
+            boundary_set.add(event["end"])
+    boundaries = sorted(boundary_set)
+
+    quantized = quantize_boundaries(boundaries, total, payload.divisions, max_shift)
+    if quantized is None:
+        # Diagnostic only: interior boundaries no tick can reach within
+        # max_shift (infeasibility may also come from the strict
+        # ordering alone, e.g. more boundaries than grid points).
+        tick = total / payload.divisions
+        unreachable = [
+            format_rational(boundary)
+            for boundary in boundaries[1:-1]
+            if min(
+                abs(boundary - k * tick) for k in range(payload.divisions + 1)
+            )
+            > max_shift
+        ]
+        # Preview only: nothing is written, feasible or not.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "no feasible quantization within max_shift; "
+                "measure was not modified",
+                "divisions": payload.divisions,
+                "max_shift": format_rational(max_shift),
+                "boundary_count": len(boundaries),
+                "unreachable_boundaries": unreachable,
+            },
+        )
+
+    mapped = dict(zip(boundaries, quantized))
+    return {
+        "measure_id": measure["id"],
+        "target_duration": format_rational(total),
+        "divisions": payload.divisions,
+        "max_shift": format_rational(max_shift),
+        "tick": format_rational(total / payload.divisions),
+        "boundaries": [
+            {"original": format_rational(boundary), "quantized": format_rational(new)}
+            for boundary, new in zip(boundaries, quantized)
+        ],
+        "voices": [
+            {
+                "name": voice["name"],
+                "events": [
+                    {
+                        "id": event["id"],
+                        "kind": event["kind"],
+                        "start": format_rational(mapped[event["start"]]),
+                        "end": format_rational(mapped[event["end"]]),
+                        "duration": format_rational(
+                            mapped[event["end"]] - mapped[event["start"]]
+                        ),
+                    }
+                    for event in voice["events"]
+                ],
+            }
+            for voice in voices
         ],
     }
 

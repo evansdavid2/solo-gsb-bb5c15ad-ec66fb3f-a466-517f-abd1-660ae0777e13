@@ -189,6 +189,62 @@ curl -s -X POST http://localhost:8000/loop-alignments \
 `loop` 表示该发声来自第几次循环。半开区间 `[start, end)` 保证循环边界处既不丢音也不
 重复计音：恰好在某次循环起点休止的声部，在该起点的段中为 `null`。
 
+### `POST /measures/{id}/quantization-preview` — 量化预览（不写库）
+
+把已保存小节**全部声部的不同事件边界**（起止点的并集）统一吸附到目标时长的
+`divisions` **等分刻度**上，返回量化结果但**不修改任何已保存数据**（纯预览，永不写库）。
+
+- 请求体：
+  - `divisions`：整数 **1～128**，把目标时长等分的份数（刻度步长 = 目标时长 / divisions）；
+  - `max_shift`：**非负有理数字符串**（如 `"0"`、`"1/8"`），每个边界允许的最大偏移量；
+    `"0"` 表示边界必须已经落在刻度上。
+- 映射规则：首尾边界固定在 `0` 与目标时长；新边界**严格递增**（因此每个事件量化后时长
+  仍为正）；多声部**共享的边界映射到同一刻度**。在所有满足「每点偏移 ≤ max_shift」的
+  可行映射中，选取**偏移绝对值总和最小**者；并列时取**刻度序列字典序最小**（同样最优时
+  边界尽量落在更靠前的刻度）。
+- 小节不存在返回 **404**；`divisions` 越界或 `max_shift` 非法返回 **422**；不存在可行
+  映射时返回 **422**（detail 含 `boundary_count` 与 `unreachable_boundaries` —— 在
+  max_shift 范围内够不到任何刻度的边界列表），且不写库。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/quantization-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"divisions": 4, "max_shift": "1/6"}'
+```
+
+例：小节边界为 `0, 1/3, 1/2, 1`（lead 声部 1/3 + 2/3，bass 声部 1/2 + 1/2），
+`divisions=4` 即刻度为 `0, 1/4, 1/2, 3/4, 1`；`1/3` 距 `1/4` 为 `1/12`、距 `1/2` 为
+`1/6`，取总偏移最小的映射：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "divisions": 4,
+  "max_shift": "1/6",
+  "tick": "1/4",
+  "boundaries": [
+    {"original": "0",   "quantized": "0"},
+    {"original": "1/3", "quantized": "1/4"},
+    {"original": "1/2", "quantized": "1/2"},
+    {"original": "1",   "quantized": "1"}
+  ],
+  "voices": [
+    {"name": "lead", "events": [
+      {"id": "v1e1", "kind": "sound", "start": "0",   "end": "1/4", "duration": "1/4"},
+      {"id": "v1e2", "kind": "rest", "start": "1/4", "end": "1", "duration": "3/4"}
+    ]},
+    {"name": "bass", "events": [
+      {"id": "v2e1", "kind": "sound", "start": "0",   "end": "1/2", "duration": "1/2"},
+      {"id": "v2e2", "kind": "sound", "start": "1/2", "end": "1",   "duration": "1/2"}
+    ]}
+  ]
+}
+```
+
+`boundaries` 给出每个原边界（精确分数）到量化后位置的对应关系；`voices` 中每个事件
+给出**原事件 ID、种类**和**量化后的起止与时长**（时长 = 量化后终点 − 起点）。
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -205,7 +261,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、边界量化（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）
